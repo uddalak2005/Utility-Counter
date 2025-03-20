@@ -1,16 +1,35 @@
+import os
 import cv2
 import tempfile
 import time
-import threading
 import numpy as np
+import streamlit as st
+import torch
+import torch.backends.cudnn as cudnn
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from inference_sdk import InferenceHTTPClient
 from concurrent.futures import ThreadPoolExecutor
 import gc
-
 from queue import Queue
 import threading
+
+
+torch._C._jit_set_profiling_executor(False)
+torch._C._jit_set_profiling_mode(False)
+
+@st.cache_resource
+def configure_torch():
+    if torch.cuda.is_available():
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+        # Prevent JIT compilation issues
+        torch.jit.disable_jit()
+    return True
+
+# Initialize torch configuration
+_ = configure_torch()
+
 
 # Add near the top of your file
 frame_queue = Queue(maxsize=10)
@@ -179,21 +198,34 @@ st.markdown("""
 def load_models():
     """Load and cache models"""
     try:
-        model = YOLO("best.pt", task='detect')
-        # Optimize for CPU inference
-        model.to('cpu')
+        # Set model path
+        model_path = os.path.join(os.path.dirname(__file__), "best.pt")
+        
+        # Load model with error handling
+        if not os.path.exists(model_path):
+            st.error("Model file not found!")
+            return None
+            
+        model = YOLO(model_path, task='detect')
+        
+        # Optimize for inference
+        model.to('cpu' if not torch.cuda.is_available() else 'cuda')
         model.conf = 0.4
         model.iou = 0.45
-        # Enable model optimization
+        
         if torch.cuda.is_available():
             model.fuse()
+        
         return model
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
         return None
 
-# Initialize at startup
+# Initialize model with error handling
 yolo_model = load_models()
+if yolo_model is None:
+    st.error("Failed to initialize model!")
+    st.stop()
 
 CLIENT = InferenceHTTPClient(
     api_url="https://detect.roboflow.com",
