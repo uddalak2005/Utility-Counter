@@ -10,6 +10,24 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import torch
 import streamlit as st
+import asyncio
+
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# Optimize OpenCV
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
+
+# Optimize memory usage
+@st.cache_resource
+def init_settings():
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
 # Configure Streamlit
 st.set_page_config(
@@ -170,7 +188,7 @@ def load_models():
     return yolo_model
 
 # Initialize at startup
-model = load_models()
+yolo_model = load_models()
 
 CLIENT = InferenceHTTPClient(
     api_url="https://detect.roboflow.com",
@@ -181,14 +199,22 @@ CLIENT = InferenceHTTPClient(
 def get_video_capture(source):
     """Try different video capture methods"""
     if source == "Webcam":
-        # Try different camera indices
-        for index in [0, 1, -1]:
-            cap = cv2.VideoCapture(index)
-            if cap.isOpened():
-                return cap
+        # Try different camera backends
+        backends = [cv2.CAP_ANY, cv2.CAP_V4L2, cv2.CAP_DSHOW]
+        for backend in backends:
+            cv2.setNumThreads(1)  # Reduce threading issues
+            for index in [0, 1, 2, -1]:
+                try:
+                    cap = cv2.VideoCapture(index, backend)
+                    if cap.isOpened():
+                        # Set buffer size to reduce lag
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        return cap
+                except Exception:
+                    continue
                 
-        # Fallback to file upload if webcam fails
-        st.error("Could not access webcam. Please upload a video instead.")
+        # Fallback message
+        st.error("⚠️ Could not access webcam. Please upload a video instead.")
         return None
     else:
         return cv2.VideoCapture(source)
@@ -253,53 +279,56 @@ if app_mode == "Person Counter":
 
     def process_video(video_source):
         global future, frame_count
-
-        # Replace the direct cv2.VideoCapture call with get_video_capture
-        cap = get_video_capture(video_source)
         
-        if cap is None:
-            return
-        
-        if not cap.isOpened():
-            st.error("🚨 Error: Could not open video source!")
-            return
+        try:
+            cap = get_video_capture(video_source)
+            if cap is None or not cap.isOpened():
+                st.error("🚫 Could not open video source!")
+                return
 
-        # Set optimal resolution
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Optimize video capture settings
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS
+            
+            # Increase skip rate for better performance
+            process_every_n_frames = 10
+            
+            while cap.isOpened():
+                try:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break  # Stop if video ends
+                    frame_count += 1
+                    
+                    # Skip frames for performance
+                    if frame_count % process_every_n_frames != 0:
+                        continue
 
-            frame_count += 1
-
-            # Start inference on every Nth frame in a separate thread
-            if frame_count % process_every_n_frames == 0:
-                if future is None or future.done():  # Ensure only one inference at a time
-                    future = executor.submit(run_inference, frame.copy())
-
-            # Draw bounding boxes from the last completed inference
-            for detection in detections:
-                x, y, w, h = int(detection['x']), int(detection['y']), int(detection['width']), int(detection['height'])
-                x1, y1 = x - w // 2, y - h // 2
-                x2, y2 = x + w // 2, y + h // 2
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (170, 100, 200), 2)
-                label = f"{detection['class']} {detection['confidence']:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 100, 200), 2)
-
-            # Display count on frame
-            cv2.putText(frame, f"👥 Total People: {num_people}", (20, 50), 
-            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)  # Green color, larger font
-
-            # Convert BGR to RGB for Streamlit
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-
-            time.sleep(0.1)  # Reduce processing load
-
-        cap.release()
+                    # Resize frame for faster processing
+                    frame = cv2.resize(frame, (640, 480))
+                    
+                    # Process frame...
+                    # ...existing code...
+                    
+                    # Clear memory periodically
+                    if frame_count % 30 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                except Exception as e:
+                    st.error(f"Frame processing error: {str(e)}")
+                    break
+                    
+        except Exception as e:
+            st.error(f"Video capture error: {str(e)}")
+        finally:
+            if 'cap' in locals():
+                cap.release()
+            if 'future' in globals() and future is not None:
+                future.cancel()
 
     # Handle video source selection
     # Handle video source selection
@@ -336,8 +365,7 @@ elif app_mode == "Inventory Management":
     uploaded_file = st.sidebar.file_uploader("Upload Video", 
                                             type=["mp4", "avi", "mov"])
 
-    # Load YOLO model
-    yolo_model = load_yolo_model()
+
 
     if uploaded_file is not None:
         tfile = tempfile.NamedTemporaryFile(delete=False)

@@ -8,4 +8,5 @@ inference-sdk
 pandas
 matplotlib
 opencv-python-headless
-
+gc
+asyncio
