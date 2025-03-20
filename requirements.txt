@@ -1,12 +1,9 @@
 streamlit
-opencv-python-headless=
+opencv-python
 torch
-numpy
 ultralytics
+numpy
 deep-sort-realtime
 inference-sdk
-pillow
-tempfile
-threading
-queue
-gc
+pandas
+matplotlib

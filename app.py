@@ -1,68 +1,14 @@
-import os
+import streamlit as st
 import cv2
 import tempfile
-import time
-import numpy as np
-import streamlit as st
 import torch
-import torch.backends.cudnn as cudnn
+import time
+import threading
+import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from inference_sdk import InferenceHTTPClient
 from concurrent.futures import ThreadPoolExecutor
-import gc
-from queue import Queue
-import threading
-
-
-torch._C._jit_set_profiling_executor(False)
-torch._C._jit_set_profiling_mode(False)
-
-@st.cache_resource
-def configure_torch():
-    if torch.cuda.is_available():
-        cudnn.benchmark = True
-        cudnn.deterministic = False
-        # Prevent JIT compilation issues
-        torch.jit.disable_jit()
-    return True
-
-# Initialize torch configuration
-_ = configure_torch()
-
-
-# Add near the top of your file
-frame_queue = Queue(maxsize=10)
-result_queue = Queue(maxsize=10)
-
-def process_frames_worker():
-    while True:
-        frame = frame_queue.get()
-        if frame is None:
-            break
-            
-        try:
-            # Process frame with model
-            results = yolo_model(frame)
-            result_queue.put(results)
-        except Exception as e:
-            result_queue.put(None)
-        finally:
-            frame_queue.task_done()
-
-# Configure Streamlit
-st.set_page_config(
-    page_title="Utility Counter",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# Optimize memory usage
-@st.cache_resource
-def init_settings():
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
 
 # Custom CSS styling
 st.markdown("""
@@ -195,66 +141,13 @@ st.markdown("""
 
 # Initialize models and clients
 @st.cache_resource
-def load_models():
-    """Load and cache models"""
-    try:
-        # Set model path
-        model_path = os.path.join(os.path.dirname(__file__), "best.pt")
-        
-        # Load model with error handling
-        if not os.path.exists(model_path):
-            st.error("Model file not found!")
-            return None
-            
-        model = YOLO(model_path, task='detect')
-        
-        # Optimize for inference
-        model.to('cpu' if not torch.cuda.is_available() else 'cuda')
-        model.conf = 0.4
-        model.iou = 0.45
-        
-        if torch.cuda.is_available():
-            model.fuse()
-        
-        return model
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None
-
-# Initialize model with error handling
-yolo_model = load_models()
-if yolo_model is None:
-    st.error("Failed to initialize model!")
-    st.stop()
+def load_yolo_model():
+    return YOLO("best.pt")
 
 CLIENT = InferenceHTTPClient(
     api_url="https://detect.roboflow.com",
     api_key="clkjEzWr0PTQR8J0SgjV"
 )
-
-# Add the new function:
-def get_video_capture(source):
-    """Try different video capture methods"""
-    if source == "Webcam":
-        # Try different camera backends
-        backends = [cv2.CAP_ANY, cv2.CAP_V4L2, cv2.CAP_DSHOW]
-        for backend in backends:
-            cv2.setNumThreads(1)  # Reduce threading issues
-            for index in [0, 1, 2, -1]:
-                try:
-                    cap = cv2.VideoCapture(index, backend)
-                    if cap.isOpened():
-                        # Set buffer size to reduce lag
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        return cap
-                except Exception:
-                    continue
-                
-        # Fallback message
-        st.error("⚠️ Could not access webcam. Please upload a video instead.")
-        return None
-    else:
-        return cv2.VideoCapture(source)
 
 # Main app
 st.title("A1 Future Technologies")
@@ -314,83 +207,77 @@ if app_mode == "Person Counter":
             st.error(f"Detection error: {str(e)}")
             return []
 
-    
-                    
     def process_video(video_source):
-        global frame_count
-        
-        try:
-            cap = get_video_capture(video_source)
-            if cap is None:
-                return
-    
-            # Start processing worker
-            worker = threading.Thread(target=process_frames_worker, daemon=True)
-            worker.start()
-    
-            # Initialize display components
-            frame_placeholder = st.empty()
-            stats_placeholder = st.sidebar.empty()
-            progress_bar = st.progress(0)
-    
-            frame_count = 0
-            skip_frames = 3  # Process every nth frame
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-    
-                frame_count += 1
-                if frame_count % skip_frames != 0:
-                    continue
-    
-                # Resize for faster processing
-                frame = cv2.resize(frame, (640, 480))
-                
-                # Add frame to processing queue
-                if not frame_queue.full():
-                    frame_queue.put(frame)
-                
-                # Get results if available
-                if not result_queue.empty():
-                    results = result_queue.get()
-                    if results:
-                        # Draw detections
-                        for r in results:
-                            boxes = r.boxes
-                            for box in boxes:
-                                b = box.xyxy[0]
-                                cv2.rectangle(frame, 
-                                            (int(b[0]), int(b[1])), 
-                                            (int(b[2]), int(b[3])), 
-                                            (0, 255, 0), 2)
-    
-                # Display frame
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_placeholder.image(frame_rgb, channels="RGB", 
-                                     use_column_width=True)
-    
-                # Update progress
-                if frame_count % 30 == 0:
-                    gc.collect()
-                    progress_bar.progress(frame_count / cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-        finally:
-            # Cleanup
-            frame_queue.put(None)  # Signal worker to stop
-            worker.join()
-            cap.release()
-            cv2.destroyAllWindows()
+        global future, frame_count
 
-    # Handle video source selection
+        cap = cv2.VideoCapture(video_source)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        resize_factor = 0.5
+        new_width = int(width * resize_factor)
+        new_height = int(height * resize_factor)
+
+        if not cap.isOpened():
+            st.error("🚨 Error: Could not open video source!")
+            return
+        
+        process_every_n_frames = 10
+
+        frame_buffer = []
+        buffer_size = 5
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break  # Stop if video ends
+
+            frame_count += 1
+
+            frame = cv2.resize(frame, (new_width, new_height))
+
+            # Start inference on every Nth frame in a separate thread
+            if frame_count % process_every_n_frames == 0:
+                if future is None or future.done():  # Ensure only one inference at a time
+                    inference_frame = cv2.resize(frame.copy(), (640, 480))
+                    future = executor.submit(run_inference, inference_frame)
+                    
+            # Draw bounding boxes from the last completed inference
+            for detection in detections:
+            # Scale coordinates back to resized frame
+                x = int(detection['x'] * resize_factor)
+                y = int(detection['y'] * resize_factor)
+                w = int(detection['width'] * resize_factor)
+                h = int(detection['height'] * resize_factor)
+                
+                x1, y1 = x - w // 2, y - h // 2
+                x2, y2 = x + w // 2, y + h // 2
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (170, 100, 200), 2)
+                
+                # Only show confidence for higher confidence detections
+                if detection['confidence'] > 0.5:
+                    label = f"{detection['class']} {detection['confidence']:.2f}"
+                    cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 100, 200), 2)
+
+        # Display count on frame
+            cv2.putText(frame, f"👥 Total People: {num_people}", (20, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)  # Reduced font size
+
+            # Convert BGR to RGB for Streamlit
+            frame_buffer.append(frame)
+            if len(frame_buffer) >= buffer_size:
+                display_frame = frame_buffer.pop(0)
+                frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+
+            time.sleep(0.03)
+
+        cap.release()
+
     # Handle video source selection
     if source == "Webcam":
         st.sidebar.warning("🔴 Press Stop to end the stream")
-        # Try webcam with index 0 first
-        process_video("Webcam")  # Changed from process_video(0)
+        process_video(0)
         
     elif source == "Upload Video":
         uploaded_file = st.sidebar.file_uploader(
@@ -400,6 +287,7 @@ if app_mode == "Person Counter":
         )
         
         if uploaded_file is not None:
+            # Save uploaded video to temp file
             tfile = tempfile.NamedTemporaryFile(delete=False)
             tfile.write(uploaded_file.read())
             
@@ -420,7 +308,8 @@ elif app_mode == "Inventory Management":
     uploaded_file = st.sidebar.file_uploader("Upload Video", 
                                             type=["mp4", "avi", "mov"])
 
-
+    # Load YOLO model
+    yolo_model = load_yolo_model()
 
     if uploaded_file is not None:
         tfile = tempfile.NamedTemporaryFile(delete=False)
