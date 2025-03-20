@@ -1,7 +1,5 @@
-import streamlit as st
 import cv2
 import tempfile
-import torch
 import time
 import threading
 import numpy as np
@@ -9,6 +7,23 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from inference_sdk import InferenceHTTPClient
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import torch
+import streamlit as st
+
+# Configure Streamlit
+st.set_page_config(
+    page_title="Utility Counter",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Optimize memory usage
+@st.cache_resource
+def init_settings():
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
 # Custom CSS styling
 st.markdown("""
@@ -141,13 +156,42 @@ st.markdown("""
 
 # Initialize models and clients
 @st.cache_resource
-def load_yolo_model():
-    return YOLO("best.pt")
+def load_models():
+    """Load and cache models"""
+    yolo_model = None
+    try:
+        # Try loading local model first
+        yolo_model = YOLO("best.pt", task='detect')
+        # Optimize model
+        yolo_model.to('cpu')  # Use CPU if GPU memory is limited
+        yolo_model.conf = 0.4  # Set confidence threshold
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+    return yolo_model
+
+# Initialize at startup
+model = load_models()
 
 CLIENT = InferenceHTTPClient(
     api_url="https://detect.roboflow.com",
     api_key="clkjEzWr0PTQR8J0SgjV"
 )
+
+# Add the new function:
+def get_video_capture(source):
+    """Try different video capture methods"""
+    if source == "Webcam":
+        # Try different camera indices
+        for index in [0, 1, -1]:
+            cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                return cap
+                
+        # Fallback to file upload if webcam fails
+        st.error("Could not access webcam. Please upload a video instead.")
+        return None
+    else:
+        return cv2.VideoCapture(source)
 
 # Main app
 st.title("A1 Future Technologies")
@@ -210,11 +254,19 @@ if app_mode == "Person Counter":
     def process_video(video_source):
         global future, frame_count
 
-        cap = cv2.VideoCapture(video_source)
-
+        # Replace the direct cv2.VideoCapture call with get_video_capture
+        cap = get_video_capture(video_source)
+        
+        if cap is None:
+            return
+        
         if not cap.isOpened():
             st.error("🚨 Error: Could not open video source!")
             return
+
+        # Set optimal resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -250,9 +302,11 @@ if app_mode == "Person Counter":
         cap.release()
 
     # Handle video source selection
+    # Handle video source selection
     if source == "Webcam":
         st.sidebar.warning("🔴 Press Stop to end the stream")
-        process_video(0)
+        # Try webcam with index 0 first
+        process_video("Webcam")  # Changed from process_video(0)
         
     elif source == "Upload Video":
         uploaded_file = st.sidebar.file_uploader(
@@ -262,7 +316,6 @@ if app_mode == "Person Counter":
         )
         
         if uploaded_file is not None:
-            # Save uploaded video to temp file
             tfile = tempfile.NamedTemporaryFile(delete=False)
             tfile.write(uploaded_file.read())
             
