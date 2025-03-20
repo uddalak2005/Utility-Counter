@@ -10,24 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import torch
 import streamlit as st
-import asyncio
-
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-# Optimize OpenCV
-cv2.setNumThreads(1)
-cv2.ocl.setUseOpenCL(False)
-
-# Optimize memory usage
-@st.cache_resource
-def init_settings():
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
 
 # Configure Streamlit
 st.set_page_config(
