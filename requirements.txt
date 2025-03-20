@@ -1,0 +1,9 @@
+streamlit
+opencv-python
+torch
+ultralytics
+numpy
+deep-sort-realtime
+inference-sdk
+pandas
+matplotlib
