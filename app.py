@@ -8,8 +8,28 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from inference_sdk import InferenceHTTPClient
 from concurrent.futures import ThreadPoolExecutor
 import gc
-import torch
-import streamlit as st
+
+from queue import Queue
+import threading
+
+# Add near the top of your file
+frame_queue = Queue(maxsize=10)
+result_queue = Queue(maxsize=10)
+
+def process_frames_worker():
+    while True:
+        frame = frame_queue.get()
+        if frame is None:
+            break
+            
+        try:
+            # Process frame with model
+            results = yolo_model(frame)
+            result_queue.put(results)
+        except Exception as e:
+            result_queue.put(None)
+        finally:
+            frame_queue.task_done()
 
 # Configure Streamlit
 st.set_page_config(
@@ -158,16 +178,19 @@ st.markdown("""
 @st.cache_resource
 def load_models():
     """Load and cache models"""
-    yolo_model = None
     try:
-        # Try loading local model first
-        yolo_model = YOLO("best.pt", task='detect')
-        # Optimize model
-        yolo_model.to('cpu')  # Use CPU if GPU memory is limited
-        yolo_model.conf = 0.4  # Set confidence threshold
+        model = YOLO("best.pt", task='detect')
+        # Optimize for CPU inference
+        model.to('cpu')
+        model.conf = 0.4
+        model.iou = 0.45
+        # Enable model optimization
+        if torch.cuda.is_available():
+            model.fuse()
+        return model
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
-    return yolo_model
+        return None
 
 # Initialize at startup
 yolo_model = load_models()
@@ -259,58 +282,76 @@ if app_mode == "Person Counter":
             st.error(f"Detection error: {str(e)}")
             return []
 
+    
+                    
     def process_video(video_source):
-        global future, frame_count
+        global frame_count
         
         try:
             cap = get_video_capture(video_source)
-            if cap is None or not cap.isOpened():
-                st.error("🚫 Could not open video source!")
+            if cap is None:
                 return
-
-            # Optimize video capture settings
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS
-            
-            # Increase skip rate for better performance
-            process_every_n_frames = 10
+    
+            # Start processing worker
+            worker = threading.Thread(target=process_frames_worker, daemon=True)
+            worker.start()
+    
+            # Initialize display components
+            frame_placeholder = st.empty()
+            stats_placeholder = st.sidebar.empty()
+            progress_bar = st.progress(0)
+    
+            frame_count = 0
+            skip_frames = 3  # Process every nth frame
             
             while cap.isOpened():
-                try:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-
-                    frame_count += 1
-                    
-                    # Skip frames for performance
-                    if frame_count % process_every_n_frames != 0:
-                        continue
-
-                    # Resize frame for faster processing
-                    frame = cv2.resize(frame, (640, 480))
-                    
-                    # Process frame...
-                    # ...existing code...
-                    
-                    # Clear memory periodically
-                    if frame_count % 30 == 0:
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            
-                except Exception as e:
-                    st.error(f"Frame processing error: {str(e)}")
+                ret, frame = cap.read()
+                if not ret:
                     break
-                    
+    
+                frame_count += 1
+                if frame_count % skip_frames != 0:
+                    continue
+    
+                # Resize for faster processing
+                frame = cv2.resize(frame, (640, 480))
+                
+                # Add frame to processing queue
+                if not frame_queue.full():
+                    frame_queue.put(frame)
+                
+                # Get results if available
+                if not result_queue.empty():
+                    results = result_queue.get()
+                    if results:
+                        # Draw detections
+                        for r in results:
+                            boxes = r.boxes
+                            for box in boxes:
+                                b = box.xyxy[0]
+                                cv2.rectangle(frame, 
+                                            (int(b[0]), int(b[1])), 
+                                            (int(b[2]), int(b[3])), 
+                                            (0, 255, 0), 2)
+    
+                # Display frame
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(frame_rgb, channels="RGB", 
+                                     use_column_width=True)
+    
+                # Update progress
+                if frame_count % 30 == 0:
+                    gc.collect()
+                    progress_bar.progress(frame_count / cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
         except Exception as e:
-            st.error(f"Video capture error: {str(e)}")
+            st.error(f"Error: {str(e)}")
         finally:
-            if 'cap' in locals():
-                cap.release()
-            if 'future' in globals() and future is not None:
-                future.cancel()
+            # Cleanup
+            frame_queue.put(None)  # Signal worker to stop
+            worker.join()
+            cap.release()
+            cv2.destroyAllWindows()
 
     # Handle video source selection
     # Handle video source selection
