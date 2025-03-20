@@ -7,3 +7,5 @@ deep-sort-realtime
 inference-sdk
 pandas
 matplotlib
+opencv-python-headless
+
